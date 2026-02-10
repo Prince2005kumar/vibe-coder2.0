@@ -1,52 +1,67 @@
 import numpy as np
 import cv2
 import torch
-# from ultralytics import YOLO
-# import mediapipe as mp
-# import clip
-# import torch
+import gc
 
 class FrameScorer:
+    """
+    Memory-optimized version for Render Free Tier (512MB RAM limit).
+    
+    Optimizations:
+    - Lazy loading: Models loaded only when first needed
+    - No YOLO: Removed to save ~200MB RAM
+    - Smaller CLIP: Using ViT-B/32 (smallest available)
+    - Memory cleanup: Explicit garbage collection after processing
+    """
+    
     def __init__(self):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"Using device: {self.device}")
+        print("Memory-optimized mode: Models will load on first use")
         
-        # Load YOLO
-        try:
-            from ultralytics import YOLO
-            # This will download the model if not present
-            self.yolo = YOLO('yolov8n.pt') 
-        except Exception as e:
-            print(f"Warning: YOLO not loaded. Composition score will be default. Error: {e}")
-            self.yolo = None
+        # Don't load models at startup - lazy load them
+        self.clip_model = None
+        self.clip_preprocess = None
+        self._clip_loaded = False
+
+    def _load_clip_if_needed(self):
+        """Lazy load CLIP model only when vibe scoring is requested."""
+        if self._clip_loaded:
+            return
             
-        # Load CLIP
         try:
+            print("Loading CLIP model (first time only)...")
             import clip
+            # Use smallest CLIP model to save memory
             self.clip_model, self.clip_preprocess = clip.load("ViT-B/32", device=self.device)
+            self._clip_loaded = True
+            print("CLIP loaded successfully")
         except Exception as e:
             print(f"Warning: CLIP not loaded. Vibe score will be 0. Error: {e}")
             self.clip_model = None
             self.clip_preprocess = None
+            self._clip_loaded = True  # Don't try again
 
     def calculate_technical_score(self, frame: np.ndarray) -> float:
         """
         Score based on:
-        1. Sharpness (Laplacian variance) - STRICTER
-        2. Exposure (Histogram analysis) - IMPROVED
-        3. Color Vibrancy (Saturation) - NEW
+        1. Sharpness (Laplacian variance)
+        2. Exposure (Histogram analysis)
+        3. Color Vibrancy (Saturation)
+        
+        No ML models needed - pure OpenCV (lightweight)
         """
         if frame is None:
             return 0.0
             
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
-        # 1. SHARPNESS (More lenient threshold)
+        # 1. SHARPNESS
         laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
         # Normalize: >500 is very sharp, <100 is blurry
         sharpness_score = np.clip(laplacian_var / 500.0, 0.0, 1.0)
         
-        # 2. EXPOSURE (IMPROVED)
+        # 2. EXPOSURE
         # Check histogram for clipping
         hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
         total_pixels = gray.shape[0] * gray.shape[1]
@@ -59,7 +74,7 @@ class FrameScorer:
         mean_brightness = np.mean(gray)
         exposure_score = max(0, 1.0 - (abs(mean_brightness - 128) / 128) - clipping_penalty)
         
-        # 3. COLOR VIBRANCY (NEW)
+        # 3. COLOR VIBRANCY
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         saturation = hsv[:, :, 1]
         mean_saturation = np.mean(saturation)
@@ -71,56 +86,72 @@ class FrameScorer:
 
     def calculate_composition_score(self, frame: np.ndarray) -> float:
         """
-        Score based on Rule of Thirds using Object Detection (YOLO).
+        Simplified composition score without YOLO (to save memory).
+        
+        Uses edge detection and center-weighting instead of object detection.
         """
-        if not self.yolo:
+        if frame is None:
             return 0.5
             
         try:
-            results = self.yolo(frame, verbose=False)
-            if not results or not results[0].boxes:
-                return 0.3 # Empty frame ?
+            # Convert to grayscale
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             
-            # Find the largest object (likely the subject)
-            boxes = results[0].boxes
-            areas = (boxes.xyxy[:, 2] - boxes.xyxy[:, 0]) * (boxes.xyxy[:, 3] - boxes.xyxy[:, 1])
-            if len(areas) == 0:
-                return 0.3
+            # Edge detection to find areas of interest
+            edges = cv2.Canny(gray, 50, 150)
+            
+            # Divide frame into 9 regions (rule of thirds)
+            h, w = edges.shape
+            third_h, third_w = h // 3, w // 3
+            
+            # Calculate edge density in each region
+            regions = []
+            for i in range(3):
+                for j in range(3):
+                    region = edges[i*third_h:(i+1)*third_h, j*third_w:(j+1)*third_w]
+                    density = np.sum(region) / (third_h * third_w * 255)
+                    regions.append(density)
+            
+            # Rule of thirds: prefer content in outer regions (not center)
+            # Regions: 0 1 2
+            #          3 4 5
+            #          6 7 8
+            # Center is region 4, prefer 0,2,6,8 (corners) and 1,3,5,7 (edges)
+            
+            center_density = regions[4]
+            edge_density = (regions[1] + regions[3] + regions[5] + regions[7]) / 4
+            corner_density = (regions[0] + regions[2] + regions[6] + regions[8]) / 4
+            
+            # Good composition has more content on edges/corners than center
+            if center_density > 0:
+                composition_score = (edge_density + corner_density) / (2 * center_density + 0.01)
+            else:
+                composition_score = edge_density + corner_density
                 
-            max_idx = np.argmax(areas.cpu().numpy())
-            box = boxes[max_idx].xywh[0] # x_center, y_center, width, height (normalized if xywhn used, but here pixels)
+            return np.clip(composition_score, 0.0, 1.0)
             
-            h, w, _ = frame.shape
-            cx, cy = box[0].item(), box[1].item()
-            
-            # Rule of thirds lines: x = 1/3 w, 2/3 w; y = 1/3 h, 2/3 h
-            target_xs = [w/3, 2*w/3]
-            target_ys = [h/3, 2*h/3]
-            
-            # Distance to nearest rule-of-thirds intersection or line
-            min_dist_x = min([abs(cx - tx) for tx in target_xs]) / w
-            min_dist_y = min([abs(cy - ty) for ty in target_ys]) / h
-            
-            # Score: 1.0 if exactly on line, lower if far
-            # Heuristic: dist of 0 -> score 1. dist of 0.3 -> score 0
-            comp_score_x = max(0, 1.0 - (min_dist_x / 0.15)) # 0.15 is tolerance
-            comp_score_y = max(0, 1.0 - (min_dist_y / 0.15))
-            
-            return (comp_score_x + comp_score_y) / 2
         except Exception as e:
-            print(f"YOLO Error: {e}")
+            print(f"Composition score error: {e}")
             return 0.5
 
     def calculate_vibe_score(self, frame: np.ndarray, text_prompt: str) -> float:
         """
         Score based on semantic similarity to text_prompt using CLIP.
+        Model is lazy-loaded on first call to save memory.
         """
-        if not self.clip_model or not text_prompt:
+        if not text_prompt:
+            return 0.0
+            
+        # Lazy load CLIP only when needed
+        self._load_clip_if_needed()
+        
+        if not self.clip_model:
             return 0.0
         
         try:
             from PIL import Image
             import clip
+            
             # Preprocess image
             image = self.clip_preprocess(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))).unsqueeze(0).to(self.device)
             
@@ -138,12 +169,16 @@ class FrameScorer:
                 # Cosine similarity
                 similarity = (image_features @ text_features.T).item()
                 
+            # Clean up tensors
+            del image, text, image_features, text_features
+            
             return max(0, similarity)
         except Exception as e:
             print(f"CLIP Error: {e}")
             return 0.0
 
     def get_total_score(self, frame: np.ndarray, text_prompt: str = "") -> dict:
+        """Calculate total score with weighted components."""
         tech = self.calculate_technical_score(frame)
         comp = self.calculate_composition_score(frame)
         vibe = self.calculate_vibe_score(frame, text_prompt) if text_prompt else 0.0
@@ -167,4 +202,22 @@ class FrameScorer:
             "composition": comp,
             "vibe": vibe
         }
-
+    
+    def cleanup(self):
+        """
+        Explicitly clean up models and free memory.
+        Call this after processing a video to reduce memory usage.
+        """
+        if self.clip_model is not None:
+            del self.clip_model
+            del self.clip_preprocess
+            self.clip_model = None
+            self.clip_preprocess = None
+            self._clip_loaded = False
+            
+        # Force garbage collection
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        print("Memory cleaned up")

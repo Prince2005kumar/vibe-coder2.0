@@ -198,6 +198,9 @@ async def analyze_video(
         
         print(f"Analysis complete! Returning {len(results)} frames")
         
+        # Clean up memory after processing (important for Render free tier)
+        scorer.cleanup()
+        
         return {
             "video_id": video_id,
             "total_frames_processed": len(candidates),
